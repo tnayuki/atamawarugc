@@ -32,6 +32,18 @@ namespace atamawarugc {
         char *heap_marks[16];
         int heap_next_free[16];
 
+        typedef struct {
+            void *obj;
+            size_t sz;
+            int mark;
+            int atomic;
+        } large_object_info;
+
+        std::vector<large_object_info> large_object_info_table;
+
+        void *large_object_min_addr = (void *)-1L;
+        void *large_object_max_addr = (void *)0;
+
         std::stack<void *, std::vector<void *> > mark_stack;
         std::set<void *> roots;
 
@@ -65,23 +77,50 @@ namespace atamawarugc {
         }
 
         void mark_object(void *obj) {
-            int heap_no = ((long)obj & 0xf0000000L) >> 28;
-            int block_no = ((long)obj & 0x0fffffffL) / (64 << (heap_no % 8));
-            int sz = 64 << (heap_no % 8);
+            if ((void *)((long)obj & 0xffffffff00000000L) == heaps[0]) {
+                int heap_no = ((long)obj & 0xf0000000L) >> 28;
+                int block_no = ((long)obj & 0x0fffffffL) / (64 << (heap_no % 8));
+                int sz = 64 << (heap_no % 8);
 
-            if (heap_marks[heap_no][block_no] == 0) {
-                heap_size += sz;
-                heap_marks[heap_no][block_no] = 1;
+                if (heap_marks[heap_no][block_no] == 0) {
+                    heap_size += sz;
+                    heap_marks[heap_no][block_no] = 1;
 
-                if (heap_no >= 8) {
-                    return;
+                    if (heap_no >= 8) {
+                        return;
+                    }
+
+                    obj = (void *)((long)obj & ~(sz - 1L));
+
+                    for (void **scan = (void **)obj; scan < (void **)(((uint8_t *)obj) + sz); scan++) {
+                        if ((void *)((long)*scan & 0xffffffff00000000L) == heaps[0] ||
+                            (large_object_min_addr <= *scan && *scan < large_object_max_addr)) {
+
+                            mark_stack.push(*scan);
+                        }
+                    }
                 }
+            } else {
+                for (int i = 0; i < large_object_info_table.size(); i++) {
+                    if (large_object_info_table[i].obj <= obj && obj < (((uint8_t *)large_object_info_table[i].obj) + large_object_info_table[i].sz)) {
+                        if (large_object_info_table[i].mark)
+                            break;
 
-                obj = (void *)((long)obj & ~(sz - 1L));
+                        large_object_info_table[i].mark = 1;
 
-                for (void **scan = (void **)obj; scan < (void **)(((uint8_t *)obj) + sz); scan++) {
-                    if ((void *)((long)*scan & 0xffffffff00000000L) == heaps[0]) {
-                        mark_stack.push(*scan);
+                        if (large_object_info_table[i].atomic)
+                            break;
+
+                        for (void **scan = (void **)large_object_info_table[i].obj; scan < (void *)(((char *)large_object_info_table[i].obj) + large_object_info_table[i].sz); scan++) {
+
+                            if ((void *)((long)*scan & 0xffffffff00000000L) == heaps[0] ||
+                                (large_object_min_addr <= *scan && *scan < large_object_max_addr)) {
+
+                                mark_stack.push(*scan);
+                            }
+                        }
+
+                        break;
                     }
                 }
             }
@@ -92,7 +131,9 @@ namespace atamawarugc {
             void *stack_end = &stack_start;
 
             for (void **scan = ((void **)stack_start) - 1; scan > (void **)stack_end; scan--) {
-                if ((void *)((long)*scan & 0xffffffff00000000L) == heaps[0]) {
+                if ((void *)((long)*scan & 0xffffffff00000000L) == heaps[0] ||
+                    (large_object_min_addr <= *scan && *scan < large_object_max_addr)) {
+
                     mark_stack.push(*scan);
                 }
             }
@@ -103,7 +144,27 @@ namespace atamawarugc {
 
         void *allocate(size_t sz, bool atomic) {
             if (sz > 8192) {
-                return NULL;
+                void *large_object = malloc(sz);
+
+                heap_size += sz;
+
+                if (large_object_min_addr > large_object) {
+                    large_object_min_addr = large_object;
+                }
+
+                if (large_object_max_addr < (void *)((char *)large_object + sz)) {
+                    large_object_max_addr = (void *)((char *)large_object + sz);
+                }
+
+                large_object_info loi;
+                loi.obj = large_object;
+                loi.sz = sz;
+                loi.mark = 0;
+                loi.atomic = atomic;
+
+                large_object_info_table.push_back(loi);
+
+                return large_object;
             }
 
             if (heaps[0] == NULL) {
@@ -170,6 +231,22 @@ namespace atamawarugc {
 
                 mark_object(obj);
             }
+
+            int new_large_object_count = 0;
+            for (int i = 0; i < large_object_info_table.size(); i++) {
+                if (!large_object_info_table[i].mark) {
+                    free(large_object_info_table[i].obj);
+                } else {
+                    heap_size += large_object_info_table[i].sz;
+
+                    large_object_info_table[new_large_object_count] = large_object_info_table[i];
+                    large_object_info_table[new_large_object_count].mark = 0;
+
+                    new_large_object_count++;
+                }
+            }
+
+            large_object_info_table.resize(new_large_object_count);
 
             for (int i = 0; i < 16; i++) {
                 for (int j = 0; j < 0x10000000 / (64 << (i % 8)); j++) {
